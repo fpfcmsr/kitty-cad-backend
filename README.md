@@ -5,6 +5,6 @@ This is a trial to see if something that works can be built.
 
 
 Main differences:
-OpenCASCADE vs Parasolid kernel
-local first vs online only
+OpenCASCADE vs Parasolid kernel  
+local first vs online only  
 + a bunch of other things
