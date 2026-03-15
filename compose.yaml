@@ -1,0 +1,27 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Containerfile
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # Uncomment and configure when ready to run the modeling-app frontend:
+  # frontend:
+  #   image: ghcr.io/kittycad/modeling-app:latest
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - VITE_KC_API_BASE_URL=http://backend:3001
+  #   depends_on:
+  #     backend:
+  #       condition: service_healthy
