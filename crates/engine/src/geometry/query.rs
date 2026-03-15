@@ -111,6 +111,47 @@ pub fn get_faces(shape: &Shape) -> Vec<Face> {
     shape.faces().collect()
 }
 
+/// Compute axis-aligned bounding box from the tessellated mesh.
+pub fn bounding_box(shape: &Shape) -> (Point3d, Point3d) {
+    let mesh = shape.mesh();
+    if mesh.vertices.is_empty() {
+        return (
+            Point3d { x: 0.0, y: 0.0, z: 0.0 },
+            Point3d { x: 0.0, y: 0.0, z: 0.0 },
+        );
+    }
+    let mut min = mesh.vertices[0];
+    let mut max = mesh.vertices[0];
+    for v in &mesh.vertices {
+        min = DVec3::new(min.x.min(v.x), min.y.min(v.y), min.z.min(v.z));
+        max = DVec3::new(max.x.max(v.x), max.y.max(v.y), max.z.max(v.z));
+    }
+    (from_dvec3(min), from_dvec3(max))
+}
+
+/// Compute minimum distance between two shapes using mesh vertices.
+pub fn entity_distance(shape_a: &Shape, shape_b: &Shape) -> (f64, f64) {
+    let mesh_a = shape_a.mesh();
+    let mesh_b = shape_b.mesh();
+
+    if mesh_a.vertices.is_empty() || mesh_b.vertices.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let mut min_dist = f64::MAX;
+    let mut max_dist = 0.0_f64;
+
+    for va in &mesh_a.vertices {
+        for vb in &mesh_b.vertices {
+            let d = va.distance(*vb);
+            min_dist = min_dist.min(d);
+            max_dist = max_dist.max(d);
+        }
+    }
+
+    (min_dist, max_dist)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +222,36 @@ mod tests {
         // OCCT TopExp_Explorer enumerates edges per face (24 for a box),
         // not unique topological edges (12).
         assert!(edge_count(&box_shape) >= 12);
+    }
+
+    #[test]
+    fn test_bounding_box() {
+        let box_shape = make_unit_box();
+        let (min, max) = bounding_box(&box_shape);
+        assert!(min.x.abs() < 0.01);
+        assert!(min.y.abs() < 0.01);
+        assert!(min.z.abs() < 0.01);
+        assert!((max.x - 1.0).abs() < 0.01);
+        assert!((max.y - 1.0).abs() < 0.01);
+        assert!((max.z - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_entity_distance() {
+        // Two boxes separated by 5 units along X
+        let box_a = make_unit_box();
+        let e1 = Edge::segment(dvec3(5.0, 0.0, 0.0), dvec3(6.0, 0.0, 0.0));
+        let e2 = Edge::segment(dvec3(6.0, 0.0, 0.0), dvec3(6.0, 1.0, 0.0));
+        let e3 = Edge::segment(dvec3(6.0, 1.0, 0.0), dvec3(5.0, 1.0, 0.0));
+        let e4 = Edge::segment(dvec3(5.0, 1.0, 0.0), dvec3(5.0, 0.0, 0.0));
+        let wire = Wire::from_edges([&e1, &e2, &e3, &e4]);
+        let face = Face::from_wire(&wire);
+        let solid = face.extrude(dvec3(0.0, 0.0, 1.0));
+        let box_b: Shape = solid.into();
+
+        let (min_d, max_d) = entity_distance(&box_a, &box_b);
+        // Min distance should be ~4.0 (gap between x=1 and x=5)
+        assert!(min_d > 3.5, "min_distance should be >3.5, got {min_d}");
+        assert!(max_d > min_d, "max should be > min");
     }
 }

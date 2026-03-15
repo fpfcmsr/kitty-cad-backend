@@ -49,6 +49,19 @@ pub enum ModelingCmd {
         tolerance: Option<f64>,
         cut_type: Option<String>,
     },
+    Solid3dShellFace {
+        object_id: Uuid,
+        face_ids: Vec<Uuid>,
+        shell_thickness: f64,
+    },
+    Sweep {
+        target: Uuid,
+        trajectory: Uuid,
+    },
+    Loft {
+        section_ids: Vec<Uuid>,
+        bez_approximate_rational: Option<bool>,
+    },
 
     // -- Booleans --
     BooleanUnion {
@@ -137,6 +150,10 @@ pub enum ModelingCmd {
         entity_id_a: Uuid,
         entity_id_b: Uuid,
         distance_type: Option<String>,
+    },
+
+    BoundingBox {
+        entity_id: Uuid,
     },
 
     // -- Export/Import --

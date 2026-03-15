@@ -113,6 +113,21 @@ pub enum OkModelingCmdResponse {
     Density {
         data: DensityData,
     },
+    Solid3dShellFace {
+        data: Solid3dShellFaceData,
+    },
+    Sweep {
+        data: SweepData,
+    },
+    Loft {
+        data: LoftData,
+    },
+    BoundingBox {
+        data: BoundingBoxData,
+    },
+    Solid3dFilletEdge {
+        data: Solid3dFilletEdgeData,
+    },
     Modeling {
         data: ModelingData,
     },
@@ -318,6 +333,36 @@ pub struct CenterOfMassData {
 pub struct DensityData {
     pub density: f64,
     pub output_unit: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Solid3dShellFaceData {
+    pub solid_id: Uuid,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SweepData {
+    pub solid_id: Uuid,
+    pub face_ids: Vec<Uuid>,
+    pub edge_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LoftData {
+    pub solid_id: Uuid,
+    pub face_ids: Vec<Uuid>,
+    pub edge_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BoundingBoxData {
+    pub min: Point3d,
+    pub max: Point3d,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Solid3dFilletEdgeData {
+    pub solid_id: Uuid,
 }
 
 /// Mesh data for client-side Three.js rendering.

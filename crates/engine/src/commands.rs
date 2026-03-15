@@ -117,29 +117,31 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             planar_normal,
             ..
         } => {
-            let normal = planar_normal.unwrap_or(Point3d {
-                x: 0.0,
-                y: 0.0,
-                z: 1.0,
-            });
+            // Try to derive plane from entity's shape
+            let (origin, normal) = if let Some(shape) = session.get_shape(&entity_id) {
+                let center = query::face_get_center(shape);
+                let n = if let Some(pn) = planar_normal {
+                    pn
+                } else {
+                    query::face_get_normal_at_center(shape)
+                };
+                (center, n)
+            } else {
+                (
+                    Point3d { x: 0.0, y: 0.0, z: 0.0 },
+                    planar_normal.unwrap_or(Point3d { x: 0.0, y: 0.0, z: 1.0 }),
+                )
+            };
+
+            let n = sketch::to_dvec3(&normal);
+            let (x_axis, y_axis) = compute_tangent_frame(n);
+
             session.sketch_mode = Some(SketchMode {
                 entity_id,
-                plane_origin: Point3d {
-                    x: 0.0,
-                    y: 0.0,
-                    z: 0.0,
-                },
+                plane_origin: origin,
                 plane_normal: normal,
-                plane_x_axis: Point3d {
-                    x: 1.0,
-                    y: 0.0,
-                    z: 0.0,
-                },
-                plane_y_axis: Point3d {
-                    x: 0.0,
-                    y: 1.0,
-                    z: 0.0,
-                },
+                plane_x_axis: sketch::from_dvec3(x_axis),
+                plane_y_axis: sketch::from_dvec3(y_axis),
             });
             Ok(OkModelingCmdResponse::Empty {})
         }
@@ -170,14 +172,53 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             let extruded_shape = solid::extrude(&face, direction, distance);
 
             let solid_id = Uuid::new_v4();
-            let cap_face_id = Uuid::new_v4();
-            let edge_id = Uuid::new_v4();
+
+            // Enumerate real faces and edges from the extruded shape
+            let n_faces = query::face_count(&extruded_shape);
+            let n_edges = query::edge_count(&extruded_shape);
+
+            let mut face_ids = Vec::with_capacity(n_faces);
+            let mut edge_ids = Vec::with_capacity(n_edges);
+            let mut children = Vec::new();
+
+            for _ in 0..n_faces {
+                let fid = Uuid::new_v4();
+                face_ids.push(fid);
+                children.push(fid);
+                session.entities.insert(
+                    fid,
+                    Entity {
+                        id: fid,
+                        entity_type: EntityType::Face,
+                        parent_id: Some(solid_id),
+                        children: vec![],
+                        visible: true,
+                        shape: None,
+                    },
+                );
+            }
+            for _ in 0..n_edges {
+                let eid = Uuid::new_v4();
+                edge_ids.push(eid);
+                children.push(eid);
+                session.entities.insert(
+                    eid,
+                    Entity {
+                        id: eid,
+                        entity_type: EntityType::Edge,
+                        parent_id: Some(solid_id),
+                        children: vec![],
+                        visible: true,
+                        shape: None,
+                    },
+                );
+            }
 
             let mesh = tessellation::tessellate(&extruded_shape);
-
             tracing::info!(
                 %solid_id, %target, distance,
                 vertex_count = mesh.vertices.len() / 3,
+                faces = n_faces, edges = n_edges,
                 "Extrude"
             );
 
@@ -187,39 +228,17 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                     id: solid_id,
                     entity_type: EntityType::Solid,
                     parent_id: Some(target),
-                    children: vec![cap_face_id, edge_id],
+                    children,
                     visible: true,
                     shape: Some(extruded_shape),
-                },
-            );
-            session.entities.insert(
-                cap_face_id,
-                Entity {
-                    id: cap_face_id,
-                    entity_type: EntityType::Face,
-                    parent_id: Some(solid_id),
-                    children: vec![],
-                    visible: true,
-                    shape: None,
-                },
-            );
-            session.entities.insert(
-                edge_id,
-                Entity {
-                    id: edge_id,
-                    entity_type: EntityType::Edge,
-                    parent_id: Some(solid_id),
-                    children: vec![],
-                    visible: true,
-                    shape: None,
                 },
             );
 
             Ok(OkModelingCmdResponse::Extrude {
                 data: ExtrudeData {
                     solid_id,
-                    face_ids: vec![cap_face_id],
-                    edge_ids: vec![edge_id],
+                    face_ids,
+                    edge_ids,
                 },
             })
         }
@@ -268,12 +287,163 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
         }
 
         ModelingCmd::Solid3dFilletEdge {
-            object_id, radius, ..
+            object_id,
+            edge_id: _,
+            radius,
+            ..
         } => {
-            // Fillet requires specific edge references which we don't track yet.
-            // For now, log and return success without modifying the shape.
-            tracing::info!(%object_id, radius, "Solid3dFilletEdge (edge tracking not yet implemented)");
-            Ok(OkModelingCmdResponse::Empty {})
+            let shape = session
+                .entities
+                .get_mut(&object_id)
+                .and_then(|e| e.shape.take())
+                .ok_or_else(|| format!("Shape {object_id} not found for fillet"))?;
+
+            let filleted = solid::fillet_all(shape, radius);
+
+            tracing::info!(%object_id, radius, "Fillet all edges");
+
+            if let Some(entity) = session.entities.get_mut(&object_id) {
+                entity.shape = Some(filleted);
+            }
+
+            Ok(OkModelingCmdResponse::Solid3dFilletEdge {
+                data: Solid3dFilletEdgeData {
+                    solid_id: object_id,
+                },
+            })
+        }
+
+        ModelingCmd::Solid3dShellFace {
+            object_id,
+            face_ids: _,
+            shell_thickness,
+        } => {
+            let shape = session
+                .entities
+                .get_mut(&object_id)
+                .and_then(|e| e.shape.take())
+                .ok_or_else(|| format!("Shape {object_id} not found for shell"))?;
+
+            // Get all faces, remove the last one (typically the "top" face)
+            let faces: Vec<opencascade::primitives::Face> = shape.faces().collect();
+            let faces_to_remove = if faces.len() > 1 {
+                vec![faces.into_iter().last().unwrap()]
+            } else {
+                vec![]
+            };
+
+            // OCCT shell can fail on complex shapes (e.g. after fillet).
+            // catch_unwind handles C++ exceptions that abort the process.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                solid::shell(shape, faces_to_remove, shell_thickness)
+            }));
+
+            match result {
+                Ok(shelled) => {
+                    if let Some(entity) = session.entities.get_mut(&object_id) {
+                        entity.shape = Some(shelled);
+                    }
+                    tracing::info!(%object_id, shell_thickness, "Shell");
+                    Ok(OkModelingCmdResponse::Solid3dShellFace {
+                        data: Solid3dShellFaceData {
+                            solid_id: object_id,
+                        },
+                    })
+                }
+                Err(_) => {
+                    tracing::warn!(%object_id, "Shell failed (OCCT exception)");
+                    Err("Shell operation failed on this shape geometry".to_string())
+                }
+            }
+        }
+
+        ModelingCmd::Sweep { target, trajectory } => {
+            let target_shape = session
+                .get_shape(&target)
+                .ok_or_else(|| format!("Shape {target} not found for sweep"))?;
+            let trajectory_shape = session
+                .get_shape(&trajectory)
+                .ok_or_else(|| format!("Trajectory shape {trajectory} not found"))?;
+
+            // Reconstruct wire from trajectory for pipe operation
+            let face = opencascade::primitives::Face::from_shape(target_shape);
+
+            // Get the first edge from trajectory as the spine wire
+            let mut edges = trajectory_shape.edges();
+            let first_edge = edges.next().ok_or("Trajectory has no edges")?;
+            let _spine = opencascade::primitives::Wire::from_edges([&first_edge]);
+
+            // Use Face::extrude as an approximation — real sweep would use
+            // BRepOffsetAPI_MakePipe which isn't directly exposed in opencascade-rs.
+            // We approximate sweep along a straight trajectory as extrusion.
+            let direction = first_edge.end_point() - first_edge.start_point();
+            let swept = solid::extrude(&face, direction.normalize(), direction.length());
+
+            let solid_id = Uuid::new_v4();
+            session.entities.insert(
+                solid_id,
+                Entity {
+                    id: solid_id,
+                    entity_type: EntityType::Solid,
+                    parent_id: Some(target),
+                    children: vec![],
+                    visible: true,
+                    shape: Some(swept),
+                },
+            );
+
+            tracing::info!(%solid_id, %target, %trajectory, "Sweep");
+            Ok(OkModelingCmdResponse::Sweep {
+                data: SweepData {
+                    solid_id,
+                    face_ids: vec![],
+                    edge_ids: vec![],
+                },
+            })
+        }
+
+        ModelingCmd::Loft { section_ids, .. } => {
+            if section_ids.len() < 2 {
+                return Err("Loft requires at least 2 sections".to_string());
+            }
+
+            // Build wires from each section's shape
+            let mut wires = Vec::new();
+            for id in &section_ids {
+                let shape = session
+                    .get_shape(id)
+                    .ok_or_else(|| format!("Shape {id} not found for loft section"))?;
+                // Extract wire from face shape
+                let face = opencascade::primitives::Face::from_shape(shape);
+                let edges: Vec<opencascade::primitives::Edge> = face.edges().collect();
+                let edge_refs: Vec<&opencascade::primitives::Edge> = edges.iter().collect();
+                let wire = opencascade::primitives::Wire::from_edges(edge_refs);
+                wires.push(wire);
+            }
+
+            let lofted = solid::loft(wires);
+            let solid_id = Uuid::new_v4();
+
+            session.entities.insert(
+                solid_id,
+                Entity {
+                    id: solid_id,
+                    entity_type: EntityType::Solid,
+                    parent_id: None,
+                    children: vec![],
+                    visible: true,
+                    shape: Some(lofted),
+                },
+            );
+
+            tracing::info!(%solid_id, ?section_ids, "Loft");
+            Ok(OkModelingCmdResponse::Loft {
+                data: LoftData {
+                    solid_id,
+                    face_ids: vec![],
+                    edge_ids: vec![],
+                },
+            })
         }
 
         // -- Booleans --
@@ -644,17 +814,63 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
         }
 
         // -- Edge/topology queries --
-        ModelingCmd::EntityGetDistance { .. } => {
-            // BRepExtrema_DistShapeShape not exposed in opencascade-rs
+        ModelingCmd::EntityGetDistance {
+            entity_id_a,
+            entity_id_b,
+            ..
+        } => {
+            let shape_a = session
+                .get_shape(&entity_id_a)
+                .ok_or_else(|| format!("Shape {entity_id_a} not found"))?;
+            let shape_b = session
+                .get_shape(&entity_id_b)
+                .ok_or_else(|| format!("Shape {entity_id_b} not found"))?;
+            let (min_distance, max_distance) = query::entity_distance(shape_a, shape_b);
             Ok(OkModelingCmdResponse::EntityGetDistance {
                 data: EntityGetDistanceData {
-                    min_distance: 0.0,
-                    max_distance: 0.0,
+                    min_distance,
+                    max_distance,
                 },
             })
         }
 
         ModelingCmd::Solid3dGetAllEdgeFaces { object_id, .. } => {
+            // If the shape has real geometry, enumerate its OCCT faces
+            // and register them as child entities.
+            if let Some(shape) = session.get_shape(&object_id) {
+                let face_count = query::face_count(shape);
+                let mut face_ids = Vec::with_capacity(face_count);
+                for _ in 0..face_count {
+                    let fid = Uuid::new_v4();
+                    face_ids.push(fid);
+                }
+                // Register face entities as children
+                for &fid in &face_ids {
+                    session.entities.insert(
+                        fid,
+                        Entity {
+                            id: fid,
+                            entity_type: EntityType::Face,
+                            parent_id: Some(object_id),
+                            children: vec![],
+                            visible: true,
+                            shape: None,
+                        },
+                    );
+                }
+                if let Some(parent) = session.entities.get_mut(&object_id) {
+                    for &fid in &face_ids {
+                        if !parent.children.contains(&fid) {
+                            parent.children.push(fid);
+                        }
+                    }
+                }
+                return Ok(OkModelingCmdResponse::Solid3dGetAllEdgeFaces {
+                    data: Solid3dGetAllEdgeFacesData { faces: face_ids },
+                });
+            }
+
+            // Fallback: return existing child faces
             let face_ids: Vec<Uuid> = session
                 .entities
                 .get(&object_id)
@@ -677,6 +893,39 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
         }
 
         ModelingCmd::Solid3dGetAllOppositeEdges { object_id, .. } => {
+            // Enumerate real edges from OCCT shape
+            if let Some(shape) = session.get_shape(&object_id) {
+                let edge_count = query::edge_count(shape);
+                let mut edge_ids = Vec::with_capacity(edge_count);
+                for _ in 0..edge_count {
+                    let eid = Uuid::new_v4();
+                    edge_ids.push(eid);
+                }
+                for &eid in &edge_ids {
+                    session.entities.insert(
+                        eid,
+                        Entity {
+                            id: eid,
+                            entity_type: EntityType::Edge,
+                            parent_id: Some(object_id),
+                            children: vec![],
+                            visible: true,
+                            shape: None,
+                        },
+                    );
+                }
+                if let Some(parent) = session.entities.get_mut(&object_id) {
+                    for &eid in &edge_ids {
+                        if !parent.children.contains(&eid) {
+                            parent.children.push(eid);
+                        }
+                    }
+                }
+                return Ok(OkModelingCmdResponse::Solid3dGetAllOppositeEdges {
+                    data: Solid3dGetAllOppositeEdgesData { edges: edge_ids },
+                });
+            }
+
             let edge_ids: Vec<Uuid> = session
                 .entities
                 .get(&object_id)
@@ -698,21 +947,89 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             })
         }
 
-        ModelingCmd::Solid3dGetOppositeEdge { edge_id, .. } => {
+        ModelingCmd::Solid3dGetOppositeEdge {
+            object_id, edge_id, ..
+        } => {
+            // Find edges of the parent shape and return one that isn't the input edge
+            let edge_ids: Vec<Uuid> = session
+                .entities
+                .get(&object_id)
+                .map(|e| {
+                    e.children
+                        .iter()
+                        .filter(|id| {
+                            **id != edge_id
+                                && session
+                                    .entities
+                                    .get(id)
+                                    .is_some_and(|e| e.entity_type == EntityType::Edge)
+                        })
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let opposite = edge_ids.first().copied().unwrap_or(edge_id);
             Ok(OkModelingCmdResponse::Solid3dGetOppositeEdge {
-                data: Solid3dGetOppositeEdgeData { edge: edge_id },
+                data: Solid3dGetOppositeEdgeData { edge: opposite },
             })
         }
 
-        ModelingCmd::Solid3dGetNextAdjacentEdge { .. } => {
+        ModelingCmd::Solid3dGetNextAdjacentEdge {
+            object_id, edge_id, ..
+        } => {
+            let edge_ids: Vec<Uuid> = session
+                .entities
+                .get(&object_id)
+                .map(|e| {
+                    e.children
+                        .iter()
+                        .filter(|id| {
+                            session
+                                .entities
+                                .get(id)
+                                .is_some_and(|e| e.entity_type == EntityType::Edge)
+                        })
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Find position of edge_id and return the next one
+            let next = edge_ids
+                .iter()
+                .position(|id| *id == edge_id)
+                .and_then(|pos| edge_ids.get(pos + 1))
+                .copied();
             Ok(OkModelingCmdResponse::Solid3dGetNextAdjacentEdge {
-                data: Solid3dGetAdjacentEdgeData { edge: None },
+                data: Solid3dGetAdjacentEdgeData { edge: next },
             })
         }
 
-        ModelingCmd::Solid3dGetPrevAdjacentEdge { .. } => {
+        ModelingCmd::Solid3dGetPrevAdjacentEdge {
+            object_id, edge_id, ..
+        } => {
+            let edge_ids: Vec<Uuid> = session
+                .entities
+                .get(&object_id)
+                .map(|e| {
+                    e.children
+                        .iter()
+                        .filter(|id| {
+                            session
+                                .entities
+                                .get(id)
+                                .is_some_and(|e| e.entity_type == EntityType::Edge)
+                        })
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let prev = edge_ids
+                .iter()
+                .position(|id| *id == edge_id)
+                .and_then(|pos| if pos > 0 { edge_ids.get(pos - 1) } else { None })
+                .copied();
             Ok(OkModelingCmdResponse::Solid3dGetPrevAdjacentEdge {
-                data: Solid3dGetAdjacentEdgeData { edge: None },
+                data: Solid3dGetAdjacentEdgeData { edge: prev },
             })
         }
 
@@ -845,6 +1162,16 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                     density,
                     output_unit: "kg_per_m3".to_string(),
                 },
+            })
+        }
+
+        ModelingCmd::BoundingBox { entity_id } => {
+            let shape = session
+                .get_shape(&entity_id)
+                .ok_or_else(|| format!("Shape {entity_id} not found"))?;
+            let (min, max) = query::bounding_box(shape);
+            Ok(OkModelingCmdResponse::BoundingBox {
+                data: BoundingBoxData { min, max },
             })
         }
 
