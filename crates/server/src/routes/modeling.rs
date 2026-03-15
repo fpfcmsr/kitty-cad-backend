@@ -3,6 +3,7 @@ use axum::extract::WebSocketUpgrade;
 use axum::response::IntoResponse;
 use axum::{routing::get, Router};
 use futures::{SinkExt, StreamExt};
+use tokio::sync::{mpsc, oneshot};
 
 use engine::commands::dispatch;
 use engine::session::Session;
@@ -18,6 +19,12 @@ async fn ws_upgrade(ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(handle_ws)
 }
 
+/// Message sent from the async WebSocket handler to the blocking engine thread.
+struct EngineRequest {
+    text: String,
+    reply: oneshot::Sender<Vec<WebSocketResponse>>,
+}
+
 async fn handle_ws(socket: WebSocket) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -29,28 +36,41 @@ async fn handle_ws(socket: WebSocket) {
         let _ = sender.send(Message::Text(json.into())).await;
     }
 
-    let mut session = Session::new();
+    // Create a channel for communicating with the engine thread.
+    // The engine thread owns the Session (which contains non-Send OCCT shapes).
+    let (engine_tx, mut engine_rx) = mpsc::channel::<EngineRequest>(32);
+
+    // Spawn a dedicated OS thread for engine operations (non-Send types).
+    std::thread::spawn(move || {
+        let mut session = Session::new();
+
+        while let Some(req) = engine_rx.blocking_recv() {
+            let responses = handle_text_message(&mut session, &req.text);
+            let _ = req.reply.send(responses);
+        }
+    });
 
     while let Some(Ok(msg)) = receiver.next().await {
         match msg {
             Message::Text(text) => {
-                let responses = handle_text_message(&mut session, &text);
-                for resp in responses {
-                    if let Ok(json) = serde_json::to_string(&resp) {
-                        if sender.send(Message::Text(json.into())).await.is_err() {
-                            return;
+                if let Some(responses) = dispatch_to_engine(&engine_tx, text.to_string()).await {
+                    for resp in responses {
+                        if let Ok(json) = serde_json::to_string(&resp) {
+                            if sender.send(Message::Text(json.into())).await.is_err() {
+                                return;
+                            }
                         }
                     }
                 }
             }
             Message::Binary(data) => {
-                // Try to parse binary as JSON text
                 if let Ok(text) = String::from_utf8(data.to_vec()) {
-                    let responses = handle_text_message(&mut session, &text);
-                    for resp in responses {
-                        if let Ok(json) = serde_json::to_string(&resp) {
-                            if sender.send(Message::Text(json.into())).await.is_err() {
-                                return;
+                    if let Some(responses) = dispatch_to_engine(&engine_tx, text).await {
+                        for resp in responses {
+                            if let Ok(json) = serde_json::to_string(&resp) {
+                                if sender.send(Message::Text(json.into())).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                     }
@@ -63,6 +83,20 @@ async fn handle_ws(socket: WebSocket) {
             _ => {}
         }
     }
+}
+
+/// Send a text message to the engine thread and await the response.
+async fn dispatch_to_engine(
+    tx: &mpsc::Sender<EngineRequest>,
+    text: String,
+) -> Option<Vec<WebSocketResponse>> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let req = EngineRequest {
+        text,
+        reply: reply_tx,
+    };
+    tx.send(req).await.ok()?;
+    reply_rx.await.ok()
 }
 
 fn handle_text_message(session: &mut Session, text: &str) -> Vec<WebSocketResponse> {
@@ -97,12 +131,10 @@ fn handle_text_message(session: &mut Session, text: &str) -> Vec<WebSocketRespon
             vec![execute_cmd(session, cmd_id, cmd)]
         }
 
-        WebSocketRequest::ModelingCmdBatchReq { requests } => {
-            requests
-                .into_iter()
-                .map(|req| execute_cmd(session, req.cmd_id, req.cmd))
-                .collect()
-        }
+        WebSocketRequest::ModelingCmdBatchReq { requests } => requests
+            .into_iter()
+            .map(|req| execute_cmd(session, req.cmd_id, req.cmd))
+            .collect(),
 
         WebSocketRequest::Unknown => {
             tracing::debug!("Received unknown WebSocket message type");

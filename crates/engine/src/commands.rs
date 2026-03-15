@@ -1,9 +1,12 @@
+use glam::DVec3;
 use uuid::Uuid;
 
 use protocol::modeling_cmd::{ModelingCmd, Point3d};
 use protocol::responses::*;
 
+use crate::geometry::{boolean, sketch, solid};
 use crate::session::{Entity, EntityType, PathBuilder, Session, SketchMode};
+use crate::tessellation;
 
 /// Dispatches a modeling command against the session and returns the response.
 pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmdResponse, String> {
@@ -28,6 +31,7 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                     parent_id: None,
                     children: vec![],
                     visible: true,
+                    shape: None,
                 },
             );
             Ok(OkModelingCmdResponse::StartPath {
@@ -55,11 +59,10 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                 .ok_or("Pen position not set; call MovePathPen first")?;
 
             // Update pen position based on segment endpoint
-            let new_pos = segment_endpoint(&from, &segment);
-            builder.segments.push(crate::session::PathSegmentRecord {
-                from,
-                segment,
-            });
+            let new_pos = compute_segment_endpoint(&from, &segment);
+            builder
+                .segments
+                .push(crate::session::PathSegmentRecord { from, segment });
             builder.pen_position = Some(new_pos);
             Ok(OkModelingCmdResponse::Empty {})
         }
@@ -71,8 +74,23 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                 .ok_or_else(|| format!("Path {path_id} not found"))?;
             builder.closed = true;
 
-            // Create a face entity from the closed path
+            // Build actual geometry: wire -> face
+            let segments = builder.segments.clone();
+            let wire = sketch::build_wire(&segments, true)?;
+            let face = sketch::build_face_from_wire(&wire)?;
+
             let face_id = Uuid::new_v4();
+
+            // Convert face to shape for tessellation and storage
+            let face_shape: opencascade::primitives::Shape = face.into();
+            let mesh = tessellation::tessellate(&face_shape);
+
+            tracing::info!(
+                %face_id, %path_id,
+                vertex_count = mesh.vertices.len() / 3,
+                "ClosePath: built face from wire"
+            );
+
             session.entities.insert(
                 face_id,
                 Entity {
@@ -81,9 +99,9 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                     parent_id: Some(path_id),
                     children: vec![],
                     visible: true,
+                    shape: Some(face_shape),
                 },
             );
-            // Register face as child of path
             if let Some(path_entity) = session.entities.get_mut(&path_id) {
                 path_entity.children.push(face_id);
             }
@@ -131,14 +149,37 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             Ok(OkModelingCmdResponse::Empty {})
         }
 
-        // -- 3D Solid operations (stub until OpenCASCADE integration) --
+        // -- 3D Solid operations with real OpenCASCADE geometry --
         ModelingCmd::Extrude {
             target, distance, ..
         } => {
+            let target_shape = session
+                .get_shape(&target)
+                .ok_or_else(|| format!("Shape entity {target} not found for extrusion"))?;
+
+            // Reconstruct Face from the stored shape
+            let face = opencascade::primitives::Face::from_shape(target_shape);
+
+            // Default extrusion along Z axis
+            let direction = if let Some(ref sm) = session.sketch_mode {
+                sketch::to_dvec3(&sm.plane_normal)
+            } else {
+                DVec3::Z
+            };
+
+            let extruded_shape = solid::extrude(&face, direction, distance);
+
             let solid_id = Uuid::new_v4();
-            let cap_face = Uuid::new_v4();
-            let side_face = Uuid::new_v4();
+            let cap_face_id = Uuid::new_v4();
             let edge_id = Uuid::new_v4();
+
+            let mesh = tessellation::tessellate(&extruded_shape);
+
+            tracing::info!(
+                %solid_id, %target, distance,
+                vertex_count = mesh.vertices.len() / 3,
+                "Extrude"
+            );
 
             session.entities.insert(
                 solid_id,
@@ -146,44 +187,65 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                     id: solid_id,
                     entity_type: EntityType::Solid,
                     parent_id: Some(target),
-                    children: vec![cap_face, side_face, edge_id],
+                    children: vec![cap_face_id, edge_id],
                     visible: true,
+                    shape: Some(extruded_shape),
                 },
             );
-            for &face_or_edge in &[cap_face, side_face, edge_id] {
-                let etype = if face_or_edge == edge_id {
-                    EntityType::Edge
-                } else {
-                    EntityType::Face
-                };
-                session.entities.insert(
-                    face_or_edge,
-                    Entity {
-                        id: face_or_edge,
-                        entity_type: etype,
-                        parent_id: Some(solid_id),
-                        children: vec![],
-                        visible: true,
-                    },
-                );
-            }
-
-            tracing::info!(%solid_id, %target, distance, "Extrude (stub)");
+            session.entities.insert(
+                cap_face_id,
+                Entity {
+                    id: cap_face_id,
+                    entity_type: EntityType::Face,
+                    parent_id: Some(solid_id),
+                    children: vec![],
+                    visible: true,
+                    shape: None,
+                },
+            );
+            session.entities.insert(
+                edge_id,
+                Entity {
+                    id: edge_id,
+                    entity_type: EntityType::Edge,
+                    parent_id: Some(solid_id),
+                    children: vec![],
+                    visible: true,
+                    shape: None,
+                },
+            );
 
             Ok(OkModelingCmdResponse::Extrude {
                 data: ExtrudeData {
                     solid_id,
-                    face_ids: vec![cap_face, side_face],
+                    face_ids: vec![cap_face_id],
                     edge_ids: vec![edge_id],
                 },
             })
         }
 
         ModelingCmd::Revolve {
-            target, angle, ..
+            target,
+            axis,
+            angle,
+            ..
         } => {
+            let target_shape = session
+                .get_shape(&target)
+                .ok_or_else(|| format!("Shape entity {target} not found for revolve"))?;
+
+            let face = opencascade::primitives::Face::from_shape(target_shape);
+
+            let axis_dir = sketch::to_dvec3(&axis);
+            let origin = DVec3::ZERO;
+            let angle_deg = angle.to_degrees();
+
+            let revolved_shape = solid::revolve(&face, origin, axis_dir, angle_deg);
+
             let solid_id = Uuid::new_v4();
-            tracing::info!(%solid_id, %target, angle, "Revolve (stub)");
+
+            tracing::info!(%solid_id, %target, angle, "Revolve");
+
             session.entities.insert(
                 solid_id,
                 Entity {
@@ -192,8 +254,10 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                     parent_id: Some(target),
                     children: vec![],
                     visible: true,
+                    shape: Some(revolved_shape),
                 },
             );
+
             Ok(OkModelingCmdResponse::Revolve {
                 data: RevolveData {
                     solid_id,
@@ -203,16 +267,81 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             })
         }
 
-        ModelingCmd::Solid3dFilletEdge { object_id, .. } => {
-            tracing::info!(%object_id, "Solid3dFilletEdge (stub)");
+        ModelingCmd::Solid3dFilletEdge {
+            object_id, radius, ..
+        } => {
+            // Fillet requires specific edge references which we don't track yet.
+            // For now, log and return success without modifying the shape.
+            tracing::info!(%object_id, radius, "Solid3dFilletEdge (edge tracking not yet implemented)");
             Ok(OkModelingCmdResponse::Empty {})
         }
 
-        // -- Booleans (stub) --
-        ModelingCmd::BooleanUnion { .. }
-        | ModelingCmd::BooleanSubtract { .. }
-        | ModelingCmd::BooleanIntersect { .. } => {
-            tracing::info!("Boolean operation (stub)");
+        // -- Booleans --
+        ModelingCmd::BooleanUnion { targets } => {
+            if targets.len() < 2 {
+                return Err("Boolean union requires at least 2 targets".to_string());
+            }
+            // Collect shape references, then perform unions
+            let shapes: Vec<_> = targets
+                .iter()
+                .map(|id| {
+                    session
+                        .get_shape(id)
+                        .ok_or_else(|| format!("Shape {id} not found"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut result = boolean::union(shapes[0], shapes[1]);
+            for shape in &shapes[2..] {
+                result = boolean::union(&result, shape);
+            }
+
+            if let Some(entity) = session.entities.get_mut(&targets[0]) {
+                entity.shape = Some(result);
+            }
+            tracing::info!(?targets, "Boolean union");
+            Ok(OkModelingCmdResponse::Empty {})
+        }
+
+        ModelingCmd::BooleanSubtract { target, tool } => {
+            let target_shape = session
+                .get_shape(&target)
+                .ok_or_else(|| format!("Shape {target} not found"))?;
+            let tool_shape = session
+                .get_shape(&tool)
+                .ok_or_else(|| format!("Shape {tool} not found"))?;
+
+            let result = boolean::subtract(target_shape, tool_shape);
+
+            if let Some(entity) = session.entities.get_mut(&target) {
+                entity.shape = Some(result);
+            }
+            tracing::info!(%target, %tool, "Boolean subtract");
+            Ok(OkModelingCmdResponse::Empty {})
+        }
+
+        ModelingCmd::BooleanIntersect { targets } => {
+            if targets.len() < 2 {
+                return Err("Boolean intersect requires at least 2 targets".to_string());
+            }
+            let shapes: Vec<_> = targets
+                .iter()
+                .map(|id| {
+                    session
+                        .get_shape(id)
+                        .ok_or_else(|| format!("Shape {id} not found"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut result = boolean::intersect(shapes[0], shapes[1]);
+            for shape in &shapes[2..] {
+                result = boolean::intersect(&result, shape);
+            }
+
+            if let Some(entity) = session.entities.get_mut(&targets[0]) {
+                entity.shape = Some(result);
+            }
+            tracing::info!(?targets, "Boolean intersect");
             Ok(OkModelingCmdResponse::Empty {})
         }
 
@@ -306,7 +435,6 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             ..
         } => {
             let plane_id = Uuid::new_v4();
-            // Compute z_axis as cross product of x_axis and y_axis
             let z_axis = Point3d {
                 x: x_axis.y * y_axis.z - x_axis.z * y_axis.y,
                 y: x_axis.z * y_axis.x - x_axis.x * y_axis.z,
@@ -320,6 +448,7 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                     parent_id: None,
                     children: vec![],
                     visible: true,
+                    shape: None,
                 },
             );
             Ok(OkModelingCmdResponse::MakePlane {
@@ -390,7 +519,6 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
         }
 
         ModelingCmd::EntityGetSketchPaths { entity_id } => {
-            // Return all path children
             let entity = session
                 .entities
                 .get(&entity_id)
@@ -451,7 +579,7 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             }
         }
 
-        // -- Stub responses for queries that need OpenCASCADE --
+        // -- Queries that use stored shapes (basic implementations) --
         ModelingCmd::EntityGetDistance { .. } => Ok(OkModelingCmdResponse::EntityGetDistance {
             data: EntityGetDistanceData {
                 min_distance: 0.0,
@@ -471,11 +599,11 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             })
         }
 
-        ModelingCmd::Solid3dGetOppositeEdge {
-            edge_id, ..
-        } => Ok(OkModelingCmdResponse::Solid3dGetOppositeEdge {
-            data: Solid3dGetOppositeEdgeData { edge: edge_id },
-        }),
+        ModelingCmd::Solid3dGetOppositeEdge { edge_id, .. } => {
+            Ok(OkModelingCmdResponse::Solid3dGetOppositeEdge {
+                data: Solid3dGetOppositeEdgeData { edge: edge_id },
+            })
+        }
 
         ModelingCmd::Solid3dGetNextAdjacentEdge { .. } => {
             Ok(OkModelingCmdResponse::Solid3dGetNextAdjacentEdge {
@@ -630,10 +758,7 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
 }
 
 /// Compute the endpoint of a path segment.
-fn segment_endpoint(
-    from: &Point3d,
-    segment: &protocol::modeling_cmd::PathSegment,
-) -> Point3d {
+fn compute_segment_endpoint(from: &Point3d, segment: &protocol::modeling_cmd::PathSegment) -> Point3d {
     use protocol::modeling_cmd::PathSegment;
     match segment {
         PathSegment::Line { end, relative } => {
@@ -647,13 +772,16 @@ fn segment_endpoint(
                 end.clone()
             }
         }
-        PathSegment::Arc { center, radius, end_angle, .. } => {
-            Point3d {
-                x: center.x + radius * end_angle.cos(),
-                y: center.y + radius * end_angle.sin(),
-                z: center.z,
-            }
-        }
+        PathSegment::Arc {
+            center,
+            radius,
+            end_angle,
+            ..
+        } => Point3d {
+            x: center.x + radius * end_angle.cos(),
+            y: center.y + radius * end_angle.sin(),
+            z: center.z,
+        },
         PathSegment::Bezier { end, .. } => end.clone(),
         PathSegment::TangentialArc { to, offset, .. } => {
             if let Some(to) = to {

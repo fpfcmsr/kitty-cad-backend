@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use opencascade::primitives::Shape;
 use uuid::Uuid;
 
 use protocol::modeling_cmd::{Point3d, UnitLength};
@@ -39,6 +40,11 @@ impl Session {
         self.selection.clear();
         self.sketch_mode = None;
     }
+
+    /// Get a shape by entity ID.
+    pub fn get_shape(&self, id: &Uuid) -> Option<&Shape> {
+        self.entities.get(id).and_then(|e| e.shape.as_ref())
+    }
 }
 
 impl Default for Session {
@@ -48,15 +54,14 @@ impl Default for Session {
 }
 
 /// Represents a stored entity in the session.
-#[derive(Debug, Clone)]
 pub struct Entity {
     pub id: Uuid,
     pub entity_type: EntityType,
     pub parent_id: Option<Uuid>,
     pub children: Vec<Uuid>,
     pub visible: bool,
-    // When OpenCASCADE is integrated, this will hold:
-    // pub shape: Option<TopoDS_Shape>,
+    /// The OpenCASCADE shape (faces, solids, edges, etc.)
+    pub shape: Option<Shape>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -3,11 +3,14 @@
 FROM registry.fedoraproject.org/fedora:43 AS builder
 
 # Install build dependencies
+# opencascade-rs bundles its own OCCT via occt-sys, but needs cmake for build scripts
+# clang is needed for cxx-build FFI generation
 RUN dnf install -y \
     gcc gcc-c++ make cmake \
-    opencascade-devel \
+    clang clang-devel \
     rust cargo \
     pkg-config \
+    fontconfig-devel \
     && dnf clean all
 
 WORKDIR /build
@@ -38,11 +41,11 @@ RUN find crates -name "*.rs" -exec touch {} +
 RUN cargo build --release
 
 # Stage 2: Runtime
+# occt-sys statically links OCCT, so we only need basic runtime libs
 FROM registry.fedoraproject.org/fedora:43
 
 RUN dnf install -y \
-    opencascade-foundation \
-    opencascade-modeling \
+    fontconfig \
     && dnf clean all
 
 COPY --from=builder /build/target/release/server /usr/local/bin/kitty-cad-backend
