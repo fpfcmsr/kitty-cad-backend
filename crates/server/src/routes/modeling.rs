@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::WebSocketUpgrade;
 use axum::response::IntoResponse;
 use axum::{routing::get, Router};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
 use engine::commands::dispatch;
 use engine::session::Session;
@@ -28,10 +31,22 @@ struct EngineRequest {
 async fn handle_ws(socket: WebSocket) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Send initial ICE server info (empty -- no WebRTC needed for local)
-    let ice_msg = WebSocketResponse::IceServerInfo {
-        ice_servers: vec![],
-    };
+    // Send modeling_session_data first (modeling-app expects this)
+    let session_msg = WebSocketResponse::server_success(OkWebSocketResponseData::ModelingSessionData {
+        data: ModelingSessionDataInner {
+            api_call_id: Uuid::new_v4(),
+        },
+    });
+    if let Ok(json) = serde_json::to_string(&session_msg) {
+        let _ = sender.send(Message::Text(json.into())).await;
+    }
+
+    // Send ICE server info (empty — no WebRTC needed for local)
+    let ice_msg = WebSocketResponse::server_success(OkWebSocketResponseData::IceServerInfo {
+        data: IceServerInfoData {
+            ice_servers: vec![],
+        },
+    });
     if let Ok(json) = serde_json::to_string(&ice_msg) {
         let _ = sender.send(Message::Text(json.into())).await;
     }
@@ -110,6 +125,16 @@ fn handle_text_message(session: &mut Session, text: &str) -> Vec<WebSocketRespon
     };
 
     match request {
+        WebSocketRequest::Headers { .. } => {
+            // Accept any auth — local backend doesn't validate tokens
+            tracing::debug!("Received auth headers (accepted)");
+            vec![]
+        }
+
+        WebSocketRequest::Ping {} => {
+            vec![WebSocketResponse::server_success(OkWebSocketResponseData::Pong {})]
+        }
+
         WebSocketRequest::Pong {} => vec![],
 
         WebSocketRequest::TrickleIce { .. } => {
@@ -119,22 +144,58 @@ fn handle_text_message(session: &mut Session, text: &str) -> Vec<WebSocketRespon
 
         WebSocketRequest::SdpOffer { .. } => {
             // Return a fake SDP answer so the client doesn't hang
-            vec![WebSocketResponse::SdpAnswer {
-                answer: SdpAnswer {
+            vec![WebSocketResponse::server_success(OkWebSocketResponseData::SdpAnswer {
+                data: SdpAnswer {
                     sdp_type: "answer".to_string(),
                     sdp: "v=0\r\n".to_string(),
                 },
-            }]
+            })]
         }
 
         WebSocketRequest::ModelingCmdReq { cmd, cmd_id } => {
             vec![execute_cmd(session, cmd_id, cmd)]
         }
 
-        WebSocketRequest::ModelingCmdBatchReq { requests } => requests
-            .into_iter()
-            .map(|req| execute_cmd(session, req.cmd_id, req.cmd))
-            .collect(),
+        WebSocketRequest::ModelingCmdBatchReq {
+            requests,
+            batch_id,
+            responses: wants_responses,
+        } => {
+            let bid = batch_id.unwrap_or_else(Uuid::new_v4);
+            let mut response_map = HashMap::new();
+
+            for req in requests {
+                let result = dispatch(session, req.cmd_id, req.cmd);
+                match result {
+                    Ok(resp) => {
+                        response_map.insert(req.cmd_id, BatchItemResponse { response: resp });
+                    }
+                    Err(e) => {
+                        tracing::warn!(cmd_id = %req.cmd_id, "Batch cmd error: {e}");
+                        // For errors in batch, use Empty as placeholder
+                        response_map.insert(
+                            req.cmd_id,
+                            BatchItemResponse {
+                                response: protocol::responses::OkModelingCmdResponse::Empty {},
+                            },
+                        );
+                    }
+                }
+            }
+
+            if wants_responses.unwrap_or(true) {
+                vec![WebSocketResponse::success(
+                    bid,
+                    OkWebSocketResponseData::ModelingBatch {
+                        data: ModelingBatchResponseData {
+                            responses: response_map,
+                        },
+                    },
+                )]
+            } else {
+                vec![]
+            }
+        }
 
         WebSocketRequest::Unknown => {
             tracing::debug!("Received unknown WebSocket message type");
@@ -145,18 +206,11 @@ fn handle_text_message(session: &mut Session, text: &str) -> Vec<WebSocketRespon
 
 fn execute_cmd(
     session: &mut Session,
-    cmd_id: uuid::Uuid,
+    cmd_id: Uuid,
     cmd: protocol::modeling_cmd::ModelingCmd,
 ) -> WebSocketResponse {
-    match dispatch(session, cmd) {
-        Ok(resp) => WebSocketResponse::Modeling {
-            result: ModelingSessionResult::Success { cmd_id, resp },
-        },
-        Err(e) => WebSocketResponse::Modeling {
-            result: ModelingSessionResult::Error {
-                cmd_id,
-                errors: vec![e],
-            },
-        },
+    match dispatch(session, cmd_id, cmd) {
+        Ok(resp) => WebSocketResponse::modeling_success(cmd_id, resp),
+        Err(e) => WebSocketResponse::error(Some(cmd_id), e),
     }
 }

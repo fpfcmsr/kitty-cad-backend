@@ -9,24 +9,26 @@ use crate::{export, tessellation};
 use crate::session::{Entity, EntityType, PathBuilder, Session, SketchMode};
 
 /// Dispatches a modeling command against the session and returns the response.
-pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmdResponse, String> {
+/// The `cmd_id` from the request is used as the entity UUID — this matches
+/// the modeling-app's convention where cmd_id IS the entity reference.
+pub fn dispatch(session: &mut Session, cmd_id: Uuid, cmd: ModelingCmd) -> Result<OkModelingCmdResponse, String> {
     match cmd {
         // -- Sketch operations --
         ModelingCmd::StartPath {} => {
-            let path_id = Uuid::new_v4();
+            // Use cmd_id as the path's entity ID (modeling-app convention)
             session.paths.insert(
-                path_id,
+                cmd_id,
                 PathBuilder {
-                    id: path_id,
+                    id: cmd_id,
                     pen_position: None,
                     segments: vec![],
                     closed: false,
                 },
             );
             session.entities.insert(
-                path_id,
+                cmd_id,
                 Entity {
-                    id: path_id,
+                    id: cmd_id,
                     entity_type: EntityType::Path,
                     parent_id: None,
                     children: vec![],
@@ -34,9 +36,7 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                     shape: None,
                 },
             );
-            Ok(OkModelingCmdResponse::StartPath {
-                data: StartPathData { path_id },
-            })
+            Ok(OkModelingCmdResponse::Empty {})
         }
 
         ModelingCmd::MovePathPen { path, to } => {
@@ -79,22 +79,20 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             let wire = sketch::build_wire(&segments, true)?;
             let face = sketch::build_face_from_wire(&wire)?;
 
-            let face_id = Uuid::new_v4();
-
-            // Convert face to shape for tessellation and storage
+            // Use cmd_id as the face entity ID
             let face_shape: opencascade::primitives::Shape = face.into();
             let mesh = tessellation::tessellate(&face_shape);
 
             tracing::info!(
-                %face_id, %path_id,
+                face_id = %cmd_id, %path_id,
                 vertex_count = mesh.vertices.len() / 3,
                 "ClosePath: built face from wire"
             );
 
             session.entities.insert(
-                face_id,
+                cmd_id,
                 Entity {
-                    id: face_id,
+                    id: cmd_id,
                     entity_type: EntityType::Face,
                     parent_id: Some(path_id),
                     children: vec![],
@@ -103,12 +101,10 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                 },
             );
             if let Some(path_entity) = session.entities.get_mut(&path_id) {
-                path_entity.children.push(face_id);
+                path_entity.children.push(cmd_id);
             }
 
-            Ok(OkModelingCmdResponse::ClosePath {
-                data: ClosePathData { face_id },
-            })
+            Ok(OkModelingCmdResponse::Empty {})
         }
 
         // -- Sketch mode --
@@ -171,26 +167,20 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
 
             let extruded_shape = solid::extrude(&face, direction, distance);
 
-            let solid_id = Uuid::new_v4();
-
-            // Enumerate real faces and edges from the extruded shape
+            // Use cmd_id as the solid entity ID
             let n_faces = query::face_count(&extruded_shape);
             let n_edges = query::edge_count(&extruded_shape);
 
-            let mut face_ids = Vec::with_capacity(n_faces);
-            let mut edge_ids = Vec::with_capacity(n_edges);
             let mut children = Vec::new();
-
             for _ in 0..n_faces {
                 let fid = Uuid::new_v4();
-                face_ids.push(fid);
                 children.push(fid);
                 session.entities.insert(
                     fid,
                     Entity {
                         id: fid,
                         entity_type: EntityType::Face,
-                        parent_id: Some(solid_id),
+                        parent_id: Some(cmd_id),
                         children: vec![],
                         visible: true,
                         shape: None,
@@ -199,14 +189,13 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             }
             for _ in 0..n_edges {
                 let eid = Uuid::new_v4();
-                edge_ids.push(eid);
                 children.push(eid);
                 session.entities.insert(
                     eid,
                     Entity {
                         id: eid,
                         entity_type: EntityType::Edge,
-                        parent_id: Some(solid_id),
+                        parent_id: Some(cmd_id),
                         children: vec![],
                         visible: true,
                         shape: None,
@@ -214,18 +203,16 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                 );
             }
 
-            let mesh = tessellation::tessellate(&extruded_shape);
             tracing::info!(
-                %solid_id, %target, distance,
-                vertex_count = mesh.vertices.len() / 3,
+                solid_id = %cmd_id, %target, distance,
                 faces = n_faces, edges = n_edges,
                 "Extrude"
             );
 
             session.entities.insert(
-                solid_id,
+                cmd_id,
                 Entity {
-                    id: solid_id,
+                    id: cmd_id,
                     entity_type: EntityType::Solid,
                     parent_id: Some(target),
                     children,
@@ -234,13 +221,7 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                 },
             );
 
-            Ok(OkModelingCmdResponse::Extrude {
-                data: ExtrudeData {
-                    solid_id,
-                    face_ids,
-                    edge_ids,
-                },
-            })
+            Ok(OkModelingCmdResponse::Empty {})
         }
 
         ModelingCmd::Revolve {
@@ -261,14 +242,12 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
 
             let revolved_shape = solid::revolve(&face, origin, axis_dir, angle_deg);
 
-            let solid_id = Uuid::new_v4();
-
-            tracing::info!(%solid_id, %target, angle, "Revolve");
+            tracing::info!(solid_id = %cmd_id, %target, angle, "Revolve");
 
             session.entities.insert(
-                solid_id,
+                cmd_id,
                 Entity {
-                    id: solid_id,
+                    id: cmd_id,
                     entity_type: EntityType::Solid,
                     parent_id: Some(target),
                     children: vec![],
@@ -277,13 +256,7 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                 },
             );
 
-            Ok(OkModelingCmdResponse::Revolve {
-                data: RevolveData {
-                    solid_id,
-                    face_ids: vec![],
-                    edge_ids: vec![],
-                },
-            })
+            Ok(OkModelingCmdResponse::Empty {})
         }
 
         ModelingCmd::Solid3dFilletEdge {
@@ -379,11 +352,10 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             let direction = first_edge.end_point() - first_edge.start_point();
             let swept = solid::extrude(&face, direction.normalize(), direction.length());
 
-            let solid_id = Uuid::new_v4();
             session.entities.insert(
-                solid_id,
+                cmd_id,
                 Entity {
-                    id: solid_id,
+                    id: cmd_id,
                     entity_type: EntityType::Solid,
                     parent_id: Some(target),
                     children: vec![],
@@ -392,14 +364,8 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                 },
             );
 
-            tracing::info!(%solid_id, %target, %trajectory, "Sweep");
-            Ok(OkModelingCmdResponse::Sweep {
-                data: SweepData {
-                    solid_id,
-                    face_ids: vec![],
-                    edge_ids: vec![],
-                },
-            })
+            tracing::info!(solid_id = %cmd_id, %target, %trajectory, "Sweep");
+            Ok(OkModelingCmdResponse::Empty {})
         }
 
         ModelingCmd::Loft { section_ids, .. } => {
@@ -422,12 +388,11 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             }
 
             let lofted = solid::loft(wires);
-            let solid_id = Uuid::new_v4();
 
             session.entities.insert(
-                solid_id,
+                cmd_id,
                 Entity {
-                    id: solid_id,
+                    id: cmd_id,
                     entity_type: EntityType::Solid,
                     parent_id: None,
                     children: vec![],
@@ -436,14 +401,8 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
                 },
             );
 
-            tracing::info!(%solid_id, ?section_ids, "Loft");
-            Ok(OkModelingCmdResponse::Loft {
-                data: LoftData {
-                    solid_id,
-                    face_ids: vec![],
-                    edge_ids: vec![],
-                },
-            })
+            tracing::info!(solid_id = %cmd_id, ?section_ids, "Loft");
+            Ok(OkModelingCmdResponse::Empty {})
         }
 
         // -- Booleans --
@@ -604,16 +563,15 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             size: _,
             ..
         } => {
-            let plane_id = Uuid::new_v4();
             let z_axis = Point3d {
                 x: x_axis.y * y_axis.z - x_axis.z * y_axis.y,
                 y: x_axis.z * y_axis.x - x_axis.x * y_axis.z,
                 z: x_axis.x * y_axis.y - x_axis.y * y_axis.x,
             };
             session.entities.insert(
-                plane_id,
+                cmd_id,
                 Entity {
-                    id: plane_id,
+                    id: cmd_id,
                     entity_type: EntityType::Plane,
                     parent_id: None,
                     children: vec![],
@@ -623,7 +581,7 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             );
             Ok(OkModelingCmdResponse::MakePlane {
                 data: MakePlaneData {
-                    plane_id,
+                    plane_id: cmd_id,
                     origin,
                     x_axis,
                     y_axis,
@@ -1206,7 +1164,7 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
         }
 
         ModelingCmd::ImportFiles { files, .. } => {
-            let object_id = Uuid::new_v4();
+            let object_id = cmd_id;
             // Try to import the first file
             if let Some(file) = files.first() {
                 if let Some(data) = &file.data {
