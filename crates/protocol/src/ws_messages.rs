@@ -73,3 +73,96 @@ pub enum ModelingSessionResult {
         errors: Vec<String>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deserialize_start_path() {
+        let json = r#"{"type":"modeling_cmd_req","cmd_id":"00000000-0000-0000-0000-000000000001","cmd":{"type":"start_path"}}"#;
+        let req: WebSocketRequest = serde_json::from_str(json).unwrap();
+        match req {
+            WebSocketRequest::ModelingCmdReq { cmd_id, cmd } => {
+                assert_eq!(cmd_id.to_string(), "00000000-0000-0000-0000-000000000001");
+                assert!(matches!(cmd, ModelingCmd::StartPath {}));
+            }
+            _ => panic!("Expected ModelingCmdReq"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_extrude() {
+        let json = r#"{"type":"modeling_cmd_req","cmd_id":"00000000-0000-0000-0000-000000000002","cmd":{"type":"extrude","target":"00000000-0000-0000-0000-000000000001","distance":5.0}}"#;
+        let req: WebSocketRequest = serde_json::from_str(json).unwrap();
+        match req {
+            WebSocketRequest::ModelingCmdReq { cmd, .. } => {
+                match cmd {
+                    ModelingCmd::Extrude { target, distance, .. } => {
+                        assert_eq!(target.to_string(), "00000000-0000-0000-0000-000000000001");
+                        assert!((distance - 5.0).abs() < f64::EPSILON);
+                    }
+                    _ => panic!("Expected Extrude"),
+                }
+            }
+            _ => panic!("Expected ModelingCmdReq"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_pong() {
+        let json = r#"{"type":"pong"}"#;
+        let req: WebSocketRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(req, WebSocketRequest::Pong {}));
+    }
+
+    #[test]
+    fn test_deserialize_unknown_type() {
+        let json = r#"{"type":"some_future_message","data":123}"#;
+        let req: WebSocketRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(req, WebSocketRequest::Unknown));
+    }
+
+    #[test]
+    fn test_deserialize_batch_request() {
+        let json = r#"{"type":"modeling_cmd_batch_req","requests":[{"cmd_id":"00000000-0000-0000-0000-000000000001","cmd":{"type":"start_path"}},{"cmd_id":"00000000-0000-0000-0000-000000000002","cmd":{"type":"scene_clear_all"}}]}"#;
+        let req: WebSocketRequest = serde_json::from_str(json).unwrap();
+        match req {
+            WebSocketRequest::ModelingCmdBatchReq { requests } => {
+                assert_eq!(requests.len(), 2);
+            }
+            _ => panic!("Expected ModelingCmdBatchReq"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_extend_path_line() {
+        let json = r#"{"type":"modeling_cmd_req","cmd_id":"00000000-0000-0000-0000-000000000001","cmd":{"type":"extend_path","path":"00000000-0000-0000-0000-000000000002","segment":{"type":"line","end":{"x":10,"y":0,"z":0},"relative":false}}}"#;
+        let req: WebSocketRequest = serde_json::from_str(json).unwrap();
+        match req {
+            WebSocketRequest::ModelingCmdReq { cmd, .. } => {
+                assert!(matches!(cmd, ModelingCmd::ExtendPath { .. }));
+            }
+            _ => panic!("Expected ModelingCmdReq"),
+        }
+    }
+
+    #[test]
+    fn test_serialize_ice_server_info() {
+        let resp = WebSocketResponse::IceServerInfo { ice_servers: vec![] };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("ice_server_info"));
+    }
+
+    #[test]
+    fn test_serialize_success_response() {
+        let resp = WebSocketResponse::Modeling {
+            result: ModelingSessionResult::Success {
+                cmd_id: Uuid::nil(),
+                resp: crate::responses::OkModelingCmdResponse::Empty {},
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("success"));
+    }
+}

@@ -166,3 +166,101 @@ fn segment_endpoint_dvec3(from: &DVec3, segment: &PathSegment) -> DVec3 {
         PathSegment::TangentialArcTo { to, .. } => to_dvec3(to),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::PathSegmentRecord;
+
+    fn make_rect_segments() -> Vec<PathSegmentRecord> {
+        vec![
+            PathSegmentRecord {
+                from: Point3d { x: 0.0, y: 0.0, z: 0.0 },
+                segment: PathSegment::Line {
+                    end: Point3d { x: 10.0, y: 0.0, z: 0.0 },
+                    relative: Some(false),
+                },
+            },
+            PathSegmentRecord {
+                from: Point3d { x: 10.0, y: 0.0, z: 0.0 },
+                segment: PathSegment::Line {
+                    end: Point3d { x: 10.0, y: 10.0, z: 0.0 },
+                    relative: Some(false),
+                },
+            },
+            PathSegmentRecord {
+                from: Point3d { x: 10.0, y: 10.0, z: 0.0 },
+                segment: PathSegment::Line {
+                    end: Point3d { x: 0.0, y: 10.0, z: 0.0 },
+                    relative: Some(false),
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn test_build_wire_closed() {
+        let segments = make_rect_segments();
+        let wire = build_wire(&segments, true).expect("Wire build failed");
+        // Should succeed without panicking
+        let _ = wire;
+    }
+
+    #[test]
+    fn test_build_face_from_closed_wire() {
+        let segments = make_rect_segments();
+        let wire = build_wire(&segments, true).expect("Wire build failed");
+        let face = build_face_from_wire(&wire).expect("Face build failed");
+        // Face should have edges
+        assert!(face.edges().count() >= 3);
+    }
+
+    #[test]
+    fn test_build_wire_empty_segments_fails() {
+        let result = build_wire(&[], true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_relative_line_segment() {
+        let segments = vec![
+            PathSegmentRecord {
+                from: Point3d { x: 5.0, y: 5.0, z: 0.0 },
+                segment: PathSegment::Line {
+                    end: Point3d { x: 10.0, y: 0.0, z: 0.0 },
+                    relative: Some(true),
+                },
+            },
+            PathSegmentRecord {
+                from: Point3d { x: 15.0, y: 5.0, z: 0.0 },
+                segment: PathSegment::Line {
+                    end: Point3d { x: 0.0, y: 10.0, z: 0.0 },
+                    relative: Some(true),
+                },
+            },
+            PathSegmentRecord {
+                from: Point3d { x: 15.0, y: 15.0, z: 0.0 },
+                segment: PathSegment::Line {
+                    end: Point3d { x: -10.0, y: 0.0, z: 0.0 },
+                    relative: Some(true),
+                },
+            },
+        ];
+        let wire = build_wire(&segments, true).expect("Wire build failed");
+        let face = build_face_from_wire(&wire).expect("Face build failed");
+        let _ = face;
+    }
+
+    #[test]
+    fn test_to_from_dvec3() {
+        let p = Point3d { x: 1.5, y: 2.5, z: 3.5 };
+        let v = to_dvec3(&p);
+        assert_eq!(v.x, 1.5);
+        assert_eq!(v.y, 2.5);
+        assert_eq!(v.z, 3.5);
+        let p2 = from_dvec3(v);
+        assert_eq!(p2.x, 1.5);
+        assert_eq!(p2.y, 2.5);
+        assert_eq!(p2.z, 3.5);
+    }
+}

@@ -4,9 +4,9 @@ use uuid::Uuid;
 use protocol::modeling_cmd::{ModelingCmd, Point3d};
 use protocol::responses::*;
 
-use crate::geometry::{boolean, sketch, solid};
+use crate::geometry::{boolean, query, sketch, solid};
+use crate::{export, tessellation};
 use crate::session::{Entity, EntityType, PathBuilder, Session, SketchMode};
-use crate::tessellation;
 
 /// Dispatches a modeling command against the session and returns the response.
 pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmdResponse, String> {
@@ -579,23 +579,122 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             }
         }
 
-        // -- Queries that use stored shapes (basic implementations) --
-        ModelingCmd::EntityGetDistance { .. } => Ok(OkModelingCmdResponse::EntityGetDistance {
-            data: EntityGetDistanceData {
-                min_distance: 0.0,
-                max_distance: 0.0,
-            },
-        }),
-
-        ModelingCmd::Solid3dGetAllEdgeFaces { .. } => {
-            Ok(OkModelingCmdResponse::Solid3dGetAllEdgeFaces {
-                data: Solid3dGetAllEdgeFacesData { faces: vec![] },
+        // -- Face queries (real OCCT implementations) --
+        ModelingCmd::FaceIsPlanar {
+            object_id, face_id,
+        } => {
+            // Try to get face shape; fall back to parent object
+            let shape = session
+                .get_shape(&face_id)
+                .or_else(|| session.get_shape(&object_id))
+                .ok_or_else(|| format!("Shape not found for face query"))?;
+            Ok(OkModelingCmdResponse::FaceIsPlanar {
+                data: FaceIsPlanarData {
+                    is_planar: query::face_is_planar(shape),
+                },
             })
         }
 
-        ModelingCmd::Solid3dGetAllOppositeEdges { .. } => {
+        ModelingCmd::FaceGetCenter {
+            object_id, face_id,
+        } => {
+            let shape = session
+                .get_shape(&face_id)
+                .or_else(|| session.get_shape(&object_id))
+                .ok_or_else(|| format!("Shape not found for face query"))?;
+            Ok(OkModelingCmdResponse::FaceGetCenter {
+                data: FaceGetCenterData {
+                    pos: query::face_get_center(shape),
+                },
+            })
+        }
+
+        ModelingCmd::FaceGetGradient {
+            object_id, face_id, ..
+        } => {
+            let shape = session
+                .get_shape(&face_id)
+                .or_else(|| session.get_shape(&object_id))
+                .ok_or_else(|| format!("Shape not found for face query"))?;
+            let normal = query::face_get_normal_at_center(shape);
+            // Compute tangent vectors from normal
+            let n = sketch::to_dvec3(&normal);
+            let (df_du, df_dv) = compute_tangent_frame(n);
+            Ok(OkModelingCmdResponse::FaceGetGradient {
+                data: FaceGetGradientData {
+                    df_du: sketch::from_dvec3(df_du),
+                    df_dv: sketch::from_dvec3(df_dv),
+                    normal,
+                },
+            })
+        }
+
+        ModelingCmd::FaceGetPosition {
+            object_id, face_id, ..
+        } => {
+            let shape = session
+                .get_shape(&face_id)
+                .or_else(|| session.get_shape(&object_id))
+                .ok_or_else(|| format!("Shape not found for face query"))?;
+            Ok(OkModelingCmdResponse::FaceGetPosition {
+                data: FaceGetPositionData {
+                    pos: query::face_get_center(shape),
+                },
+            })
+        }
+
+        // -- Edge/topology queries --
+        ModelingCmd::EntityGetDistance { .. } => {
+            // BRepExtrema_DistShapeShape not exposed in opencascade-rs
+            Ok(OkModelingCmdResponse::EntityGetDistance {
+                data: EntityGetDistanceData {
+                    min_distance: 0.0,
+                    max_distance: 0.0,
+                },
+            })
+        }
+
+        ModelingCmd::Solid3dGetAllEdgeFaces { object_id, .. } => {
+            let face_ids: Vec<Uuid> = session
+                .entities
+                .get(&object_id)
+                .map(|e| {
+                    e.children
+                        .iter()
+                        .filter(|id| {
+                            session
+                                .entities
+                                .get(id)
+                                .is_some_and(|e| e.entity_type == EntityType::Face)
+                        })
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(OkModelingCmdResponse::Solid3dGetAllEdgeFaces {
+                data: Solid3dGetAllEdgeFacesData { faces: face_ids },
+            })
+        }
+
+        ModelingCmd::Solid3dGetAllOppositeEdges { object_id, .. } => {
+            let edge_ids: Vec<Uuid> = session
+                .entities
+                .get(&object_id)
+                .map(|e| {
+                    e.children
+                        .iter()
+                        .filter(|id| {
+                            session
+                                .entities
+                                .get(id)
+                                .is_some_and(|e| e.entity_type == EntityType::Edge)
+                        })
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default();
             Ok(OkModelingCmdResponse::Solid3dGetAllOppositeEdges {
-                data: Solid3dGetAllOppositeEdgesData { edges: vec![] },
+                data: Solid3dGetAllOppositeEdgesData { edges: edge_ids },
             })
         }
 
@@ -617,50 +716,7 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             })
         }
 
-        ModelingCmd::FaceIsPlanar { .. } => Ok(OkModelingCmdResponse::FaceIsPlanar {
-            data: FaceIsPlanarData { is_planar: true },
-        }),
-
-        ModelingCmd::FaceGetCenter { .. } => Ok(OkModelingCmdResponse::FaceGetCenter {
-            data: FaceGetCenterData {
-                pos: Point3d {
-                    x: 0.0,
-                    y: 0.0,
-                    z: 0.0,
-                },
-            },
-        }),
-
-        ModelingCmd::FaceGetGradient { .. } => Ok(OkModelingCmdResponse::FaceGetGradient {
-            data: FaceGetGradientData {
-                df_du: Point3d {
-                    x: 1.0,
-                    y: 0.0,
-                    z: 0.0,
-                },
-                df_dv: Point3d {
-                    x: 0.0,
-                    y: 1.0,
-                    z: 0.0,
-                },
-                normal: Point3d {
-                    x: 0.0,
-                    y: 0.0,
-                    z: 1.0,
-                },
-            },
-        }),
-
-        ModelingCmd::FaceGetPosition { .. } => Ok(OkModelingCmdResponse::FaceGetPosition {
-            data: FaceGetPositionData {
-                pos: Point3d {
-                    x: 0.0,
-                    y: 0.0,
-                    z: 0.0,
-                },
-            },
-        }),
-
+        // -- Curve queries --
         ModelingCmd::CurveGetControlPoints { .. } => {
             Ok(OkModelingCmdResponse::CurveGetControlPoints {
                 data: CurveGetControlPointsData {
@@ -669,20 +725,26 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             })
         }
 
-        ModelingCmd::CurveGetEndPoints { .. } => Ok(OkModelingCmdResponse::CurveGetEndPoints {
-            data: CurveGetEndPointsData {
-                start: Point3d {
-                    x: 0.0,
-                    y: 0.0,
-                    z: 0.0,
+        ModelingCmd::CurveGetEndPoints { curve_id } => {
+            // Try to get shape and extract edge endpoints
+            if let Some(shape) = session.get_shape(&curve_id) {
+                let mut edges = shape.edges();
+                if let Some(edge) = edges.next() {
+                    return Ok(OkModelingCmdResponse::CurveGetEndPoints {
+                        data: CurveGetEndPointsData {
+                            start: sketch::from_dvec3(edge.start_point()),
+                            end: sketch::from_dvec3(edge.end_point()),
+                        },
+                    });
+                }
+            }
+            Ok(OkModelingCmdResponse::CurveGetEndPoints {
+                data: CurveGetEndPointsData {
+                    start: Point3d { x: 0.0, y: 0.0, z: 0.0 },
+                    end: Point3d { x: 0.0, y: 0.0, z: 0.0 },
                 },
-                end: Point3d {
-                    x: 0.0,
-                    y: 0.0,
-                    z: 0.0,
-                },
-            },
-        }),
+            })
+        }
 
         ModelingCmd::CurveGetType { .. } => Ok(OkModelingCmdResponse::CurveGetType {
             data: CurveGetTypeData {
@@ -690,53 +752,157 @@ pub fn dispatch(session: &mut Session, cmd: ModelingCmd) -> Result<OkModelingCmd
             },
         }),
 
-        // -- Measurements (stub) --
-        ModelingCmd::Mass { .. } => Ok(OkModelingCmdResponse::Mass {
-            data: MassData {
-                mass: 0.0,
-                output_unit: "kg".to_string(),
-            },
-        }),
-
-        ModelingCmd::Volume { .. } => Ok(OkModelingCmdResponse::Volume {
-            data: VolumeData {
-                volume: 0.0,
-                output_unit: "m3".to_string(),
-            },
-        }),
-
-        ModelingCmd::SurfaceArea { .. } => Ok(OkModelingCmdResponse::SurfaceArea {
-            data: SurfaceAreaData {
-                surface_area: 0.0,
-                output_unit: "m2".to_string(),
-            },
-        }),
-
-        ModelingCmd::CenterOfMass { .. } => Ok(OkModelingCmdResponse::CenterOfMass {
-            data: CenterOfMassData {
-                center_of_mass: Point3d {
-                    x: 0.0,
-                    y: 0.0,
-                    z: 0.0,
+        // -- Measurements (real OCCT implementations) --
+        ModelingCmd::Mass {
+            entity_ids,
+            material_density,
+            ..
+        } => {
+            let mut total_volume = 0.0;
+            for id in &entity_ids {
+                if let Some(shape) = session.get_shape(id) {
+                    total_volume += query::volume(shape);
+                }
+            }
+            let mass = total_volume * material_density;
+            Ok(OkModelingCmdResponse::Mass {
+                data: MassData {
+                    mass,
+                    output_unit: "kg".to_string(),
                 },
-                output_unit: "mm".to_string(),
-            },
-        }),
+            })
+        }
 
-        ModelingCmd::Density { .. } => Ok(OkModelingCmdResponse::Density {
-            data: DensityData {
-                density: 0.0,
-                output_unit: "kg_per_m3".to_string(),
-            },
-        }),
+        ModelingCmd::Volume { entity_ids, .. } => {
+            let mut total_volume = 0.0;
+            for id in &entity_ids {
+                if let Some(shape) = session.get_shape(id) {
+                    total_volume += query::volume(shape);
+                }
+            }
+            Ok(OkModelingCmdResponse::Volume {
+                data: VolumeData {
+                    volume: total_volume,
+                    output_unit: "mm3".to_string(),
+                },
+            })
+        }
 
-        // -- Export/Import (stub) --
-        ModelingCmd::Export { .. } => Ok(OkModelingCmdResponse::Export {
-            data: ExportData { files: vec![] },
-        }),
+        ModelingCmd::SurfaceArea { entity_ids, .. } => {
+            let mut total_area = 0.0;
+            for id in &entity_ids {
+                if let Some(shape) = session.get_shape(id) {
+                    total_area += query::surface_area(shape);
+                }
+            }
+            Ok(OkModelingCmdResponse::SurfaceArea {
+                data: SurfaceAreaData {
+                    surface_area: total_area,
+                    output_unit: "mm2".to_string(),
+                },
+            })
+        }
 
-        ModelingCmd::ImportFiles { .. } => {
+        ModelingCmd::CenterOfMass { entity_ids, .. } => {
+            // Use center of mass of the first entity
+            if let Some(id) = entity_ids.first() {
+                if let Some(shape) = session.get_shape(id) {
+                    let com = query::center_of_mass(shape);
+                    return Ok(OkModelingCmdResponse::CenterOfMass {
+                        data: CenterOfMassData {
+                            center_of_mass: com,
+                            output_unit: "mm".to_string(),
+                        },
+                    });
+                }
+            }
+            Ok(OkModelingCmdResponse::CenterOfMass {
+                data: CenterOfMassData {
+                    center_of_mass: Point3d { x: 0.0, y: 0.0, z: 0.0 },
+                    output_unit: "mm".to_string(),
+                },
+            })
+        }
+
+        ModelingCmd::Density {
+            entity_ids,
+            material_mass,
+            ..
+        } => {
+            let mut total_volume = 0.0;
+            for id in &entity_ids {
+                if let Some(shape) = session.get_shape(id) {
+                    total_volume += query::volume(shape);
+                }
+            }
+            let density = if total_volume > 0.0 {
+                material_mass / total_volume
+            } else {
+                0.0
+            };
+            Ok(OkModelingCmdResponse::Density {
+                data: DensityData {
+                    density,
+                    output_unit: "kg_per_m3".to_string(),
+                },
+            })
+        }
+
+        // -- Export/Import (real implementations) --
+        ModelingCmd::Export {
+            entity_ids, format,
+        } => {
+            use protocol::modeling_cmd::ExportFormat;
+
+            let mut files = vec![];
+            for id in &entity_ids {
+                if let Some(shape) = session.get_shape(id) {
+                    let (name, contents) = match &format {
+                        ExportFormat::Step {} => {
+                            let data = export::export_step(shape)?;
+                            ("export.step".to_string(), data)
+                        }
+                        ExportFormat::Stl { .. } => {
+                            let data = export::export_stl(shape)?;
+                            ("export.stl".to_string(), data)
+                        }
+                        _ => {
+                            return Err(format!("Export format {format:?} not yet supported"));
+                        }
+                    };
+                    files.push(ExportFileData { name, contents });
+                }
+            }
+            Ok(OkModelingCmdResponse::Export {
+                data: ExportData { files },
+            })
+        }
+
+        ModelingCmd::ImportFiles { files, .. } => {
             let object_id = Uuid::new_v4();
+            // Try to import the first file
+            if let Some(file) = files.first() {
+                if let Some(data) = &file.data {
+                    match export::import_step(data) {
+                        Ok(shape) => {
+                            session.entities.insert(
+                                object_id,
+                                Entity {
+                                    id: object_id,
+                                    entity_type: EntityType::Solid,
+                                    parent_id: None,
+                                    children: vec![],
+                                    visible: true,
+                                    shape: Some(shape),
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Import failed: {e}");
+                        }
+                    }
+                }
+            }
             Ok(OkModelingCmdResponse::ImportFiles {
                 data: ImportFilesData { object_id },
             })
@@ -798,4 +964,17 @@ fn compute_segment_endpoint(from: &Point3d, segment: &protocol::modeling_cmd::Pa
         }
         PathSegment::TangentialArcTo { to, .. } => to.clone(),
     }
+}
+
+/// Compute two orthogonal tangent vectors from a normal vector.
+fn compute_tangent_frame(n: DVec3) -> (DVec3, DVec3) {
+    // Pick a vector not parallel to n
+    let up = if n.x.abs() < 0.9 {
+        DVec3::X
+    } else {
+        DVec3::Y
+    };
+    let df_du = n.cross(up).normalize();
+    let df_dv = n.cross(df_du).normalize();
+    (df_du, df_dv)
 }
